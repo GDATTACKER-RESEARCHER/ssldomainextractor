@@ -2,155 +2,199 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Configurable parameters
-var (
-	timeout          = 50 * time.Second
-	concurrency      int
-	resolversFile    string
-	defaultUserAgent = "Mozilla/5.0 (X11; Linux i686; rv:131.0) Gecko/20100101 Firefox/131.0"
-)
+var customUserAgent string
+var concurrencyLimit int
+var timeout = 50 * time.Second
+var domainTimeout = 50 * time.Second
 
-type Result struct {
-	Index  int
-	Domain string
-	Error  error
-}
-
-// Reads lines from stdin or a file
-func readDomains(inputPath string) ([]string, error) {
-	var scanner *bufio.Scanner
-	var file *os.File
-	var err error
-
-	if inputPath != "" {
-		file, err = os.Open(inputPath)
-		if err != nil {
-			return nil, err
-		}
-		defer file.Close()
-		scanner = bufio.NewScanner(file)
-	} else {
-		scanner = bufio.NewScanner(os.Stdin)
-	}
-
-	var domains []string
-	for scanner.Scan() {
-		d := strings.TrimSpace(scanner.Text())
-		if d != "" {
-			domains = append(domains, d)
-		}
-	}
-	return domains, scanner.Err()
-}
-
-// Extract SANs from SSL cert
-func fetchSANs(domain string, resolvers []string) error {
+func getCertDomainsWithContext(ctx context.Context, domain string, resolvers []string) ([]string, error) {
+	var allDomains []string
 	ports := []string{"443", "80"}
+
 	for _, port := range ports {
-		err := tryTLS(domain, port, resolvers)
+		domains, err := getDomainsFromPortWithContext(ctx, domain, port, resolvers)
 		if err == nil {
-			fmt.Printf("✔️  %s\n", domain)
-			return nil
+			allDomains = append(allDomains, domains...)
 		}
 	}
-	return fmt.Errorf("no SANs found")
+
+	if len(allDomains) == 0 {
+		return nil, fmt.Errorf("no SANs found for %s", domain)
+	}
+	return allDomains, nil
 }
 
-// TLS connection attempt
-func tryTLS(domain, port string, resolvers []string) error {
-	dialer := &net.Dialer{
-		Timeout: timeout,
+func getDomainsFromPortWithContext(ctx context.Context, domain, port string, resolvers []string) ([]string, error) {
+	var domains []string
+
+	var dialer *net.Dialer
+	if len(resolvers) > 0 {
+		dialer = &net.Dialer{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial:     customDialer(resolvers),
+			},
+			Timeout: timeout,
+		}
+	} else {
+		dialer = &net.Dialer{Timeout: timeout}
 	}
+
 	conn, err := tls.DialWithDialer(dialer, "tcp", domain+":"+port, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer conn.Close()
-	if len(conn.ConnectionState().PeerCertificates) == 0 {
-		return fmt.Errorf("no certs")
+
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) > 0 {
+		for _, name := range state.PeerCertificates[0].DNSNames {
+			domains = append(domains, name)
+		}
 	}
-	return nil
+
+	return domains, nil
 }
 
-func worker(id int, jobs <-chan int, domains []string, results chan<- Result, resolvers []string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	for i := range jobs {
-		err := fetchSANs(domains[i], resolvers)
-		results <- Result{Index: i, Domain: domains[i], Error: err}
+func customDialer(resolvers []string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		for _, resolver := range resolvers {
+			conn, err := net.DialTimeout("tcp", resolver+":53", timeout)
+			if err == nil {
+				return conn, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to resolve using provided resolvers")
 	}
+}
+
+func writeToHandle(f *os.File, domains []string) {
+	for _, d := range domains {
+		if _, err := f.WriteString(fmt.Sprintf("%s\n", d)); err != nil {
+			log.Printf("Error writing to file: %v", err)
+		}
+	}
+}
+
+func processDomain(domain string, wg *sync.WaitGroup, mu *sync.Mutex, progress *int64, total int, resolvers []string, rateLimiter chan struct{}, failedLog, skipLog, sslFile, nonwildFile *os.File) {
+	defer wg.Done()
+	rateLimiter <- struct{}{}
+	defer func() { <-rateLimiter }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), domainTimeout)
+	defer cancel()
+
+	domains, err := getCertDomainsWithContext(ctx, domain, resolvers)
+	if err != nil {
+		mu.Lock()
+		if ctx.Err() == context.DeadlineExceeded {
+			_, _ = skipLog.WriteString(domain + "\n")
+		}
+		_, _ = failedLog.WriteString(domain + "\n")
+		mu.Unlock()
+		return
+	}
+
+	var wildcardDomains, nonWildcardDomains []string
+	for _, d := range domains {
+		if strings.HasPrefix(d, "*.") {
+			wildcardDomains = append(wildcardDomains, d)
+		} else {
+			nonWildcardDomains = append(nonWildcardDomains, d)
+		}
+	}
+
+	mu.Lock()
+	writeToHandle(sslFile, wildcardDomains)
+	writeToHandle(nonwildFile, nonWildcardDomains)
+	mu.Unlock()
+
+	if atomic.AddInt64(progress, 1)%500 == 0 {
+		runtime.GC() // Helps with memory on long runs
+	}
+
+	fmt.Printf("\rProcessing %d/%d domains... Current: %s", atomic.LoadInt64(progress), total, domain)
 }
 
 func main() {
-	var inputPath string
-	flag.StringVar(&inputPath, "input", "", "Input file with domains (optional if using stdin)")
-	flag.IntVar(&concurrency, "concurrency", 50, "Concurrency level (default 50)")
-	flag.StringVar(&resolversFile, "resolvers", "", "File with custom DNS resolvers")
+	var customUserAgentFlag, resolversFlag string
+	var concurrencyFlag int
+
+	flag.StringVar(&customUserAgentFlag, "user-agent", "Mozilla/5.0", "Custom User-Agent")
+	flag.StringVar(&resolversFlag, "resolvers", "", "File with custom DNS resolvers")
+	flag.IntVar(&concurrencyFlag, "concurrency", 100, "Number of concurrent workers")
 	flag.Parse()
 
-	domains, err := readDomains(inputPath)
-	if err != nil || len(domains) == 0 {
-		log.Fatal("No valid domains provided.")
-	}
+	customUserAgent = customUserAgentFlag
+	concurrencyLimit = concurrencyFlag
 
 	var resolvers []string
-	if resolversFile != "" {
-		file, err := os.Open(resolversFile)
+	if resolversFlag != "" {
+		file, err := os.Open(resolversFlag)
 		if err != nil {
-			log.Fatalf("Failed to open resolvers file: %v", err)
+			log.Fatalf("Failed to read resolvers file: %v", err)
 		}
 		defer file.Close()
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				resolvers = append(resolvers, line)
+			resolver := strings.TrimSpace(scanner.Text())
+			if resolver != "" {
+				resolvers = append(resolvers, resolver)
 			}
 		}
 	}
 
-	jobs := make(chan int, len(domains))
-	results := make(chan Result, len(domains))
-	var wg sync.WaitGroup
-
-	// Start workers
-	for w := 0; w < concurrency; w++ {
-		wg.Add(1)
-		go worker(w, jobs, domains, results, resolvers, &wg)
-	}
-
-	// Dispatch jobs
-	for i := range domains {
-		jobs <- i
-	}
-	close(jobs)
-
-	// Wait for workers
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Store ordered results
-	ordered := make([]Result, len(domains))
-	for res := range results {
-		ordered[res.Index] = res
-	}
-
-	// Output in input order
-	for _, res := range ordered {
-		if res.Error != nil {
-			fmt.Printf("❌  %s\n", res.Domain)
+	scanner := bufio.NewScanner(os.Stdin)
+	domainMap := make(map[string]struct{})
+	var domains []string
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" {
+			if _, exists := domainMap[domain]; !exists {
+				domainMap[domain] = struct{}{}
+				domains = append(domains, domain)
+			}
 		}
 	}
+
+	if len(domains) == 0 {
+		log.Fatal("No domains provided")
+	}
+
+	failedLog, _ := os.OpenFile("failed_domains.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	defer failedLog.Close()
+	skipLog, _ := os.OpenFile("skip.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	defer skipLog.Close()
+	sslFile, _ := os.OpenFile("ssl.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	defer sslFile.Close()
+	nonwildFile, _ := os.OpenFile("nonwild.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	defer nonwildFile.Close()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var progress int64
+	total := len(domains)
+	rateLimiter := make(chan struct{}, concurrencyLimit)
+
+	for _, domain := range domains {
+		wg.Add(1)
+		go processDomain(domain, &wg, &mu, &progress, total, resolvers, rateLimiter, failedLog, skipLog, sslFile, nonwildFile)
+	}
+
+	wg.Wait()
+	fmt.Println("\nProcessing complete.")
 }
